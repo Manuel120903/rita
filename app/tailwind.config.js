@@ -1,0 +1,38 @@
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: ['./App.tsx', './src/**/*.{js,jsx,ts,tsx}'],
+  presets: [require('nativewind/preset')],
+  theme: {
+    extend: {
+      colors: {
+        background: '#f6faff',
+        surface: '#ffffff',
+        surfaceAlt: '#e6eff8',
+        'surface-container': '#e6eff8',
+        'surface-container-low': '#ecf5fe',
+        'surface-container-high': '#e0e9f2',
+        'surface-container-highest': '#dbe4ed',
+        'surface-container-lowest': '#ffffff',
+        primary: '#b61c25',
+        'primary-container': '#ffdad7',
+        'on-primary': '#ffffff',
+        'on-primary-container': '#930014',
+        secondary: '#5b5f63',
+        'secondary-container': '#dde0e5',
+        'on-secondary-container': '#5f6368',
+        tertiary: '#006867',
+        'tertiary-fixed': '#97f2f0',
+        'on-tertiary-fixed': '#002020',
+        'tertiary-container': '#dafaf8',
+        'on-surface': '#141d23',
+        'on-surface-variant': '#5b403e',
+        outline: '#e3bebb',
+        mild: '#22C55E',
+        moderate: '#d97706',
+        severe: '#b61c25',
+        muted: '#5b5f63',
+      },
+    },
+  },
+  plugins: [],
+};
