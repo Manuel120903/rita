@@ -21,6 +21,9 @@ const MARGIN = 40;
 const CONTENT_WIDTH = PAGE_WIDTH - MARGIN * 2;
 const FOOTER_TOP = PAGE_HEIGHT - 52;
 
+/** Caps the episode table at a handful of pages regardless of how many the range actually has. */
+const MAX_PDF_EPISODES = 200;
+
 const SEVERITY_COLORS: Rgb[] = [MILD, MODERATE, SEVERE];
 
 export interface ReportData {
@@ -31,7 +34,13 @@ export interface ReportData {
   generatedAt: number;
   /** Measured ms per reading, which is what turns counts into time. */
   cadenceMs: number;
+  /** Minutes with tremor per weekday (index 0 = Sunday), as shown on the Semana/Mes history view. */
+  weekdayMinutes: number[];
+  /** Minutes with tremor per hour of day (index 0-23), as shown on the Semana/Mes history view. */
+  hourMinutes: number[];
 }
+
+const WEEKDAY_LABELS = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
 
 function formatTime(ms: number): string {
   const d = new Date(ms);
@@ -187,10 +196,15 @@ export function buildReportPdf(data: ReportData): string {
     y += 20;
   }
 
-  // ---- Gráfico -------------------------------------------------------------
+  // ---- Gráfico por hora/día --------------------------------------------------
+  // Same three sections HistoryScreen shows, in the same order: the time-axis
+  // chart always, then - only for Semana/Mes, where they add information the
+  // time axis alone doesn't (see the screen's own note on this) - the
+  // weekday and hour-of-day breakdowns.
   const plan = bucketPlan(data.range);
+  const isDay = data.range.kind === 'day';
   if (totalReadings > 0) {
-    sectionTitle(plan.hourly ? 'Tiempo con temblor por hora' : 'Tiempo con temblor por día');
+    sectionTitle(plan.hourly ? 'Por hora' : 'Por día');
 
     const chartHeight = 110;
     ensureSpace(chartHeight + 26);
@@ -238,8 +252,92 @@ export function buildReportPdf(data: ReportData): string {
     y += chartHeight + 26;
   }
 
+  // ---- Por día de la semana / por hora --------------------------------------
+  // Single-series bar chart over a fixed category axis (weekday or hour of
+  // day) instead of a time axis - same shape and color as the app's own
+  // BarMetricChart. `values` are already minutes; unlike the chart above,
+  // there is no severity split to stack, so this is also simpler to draw.
+  const drawCategoryBarChart = (title: string, labels: string[], values: number[]) => {
+    const maxMinutes = Math.max(...values, 0);
+    sectionTitle(title);
+    if (maxMinutes <= 0) {
+      ensureSpace(16);
+      pdf.text('Sin temblor en este período.', MARGIN, y, { size: 9, color: GREY });
+      y += 20;
+      return;
+    }
+
+    const chartHeight = 100;
+    ensureSpace(chartHeight + 26);
+
+    pdf.line(MARGIN, y + chartHeight, PAGE_WIDTH - MARGIN, y + chartHeight, GREY, 0.8);
+
+    const slot = CONTENT_WIDTH / Math.max(1, values.length);
+    const barW = Math.max(2, Math.min(18, slot * 0.62));
+    const step = slot < 14 ? (values.length > 20 ? 3 : 2) : 1;
+
+    values.forEach((minutes, index) => {
+      const x = MARGIN + slot * index + (slot - barW) / 2;
+      const h = (minutes / maxMinutes) * chartHeight;
+      if (h > 0) {
+        pdf.rect(x, y + chartHeight - h, barW, h, SEVERE);
+      }
+      if (index % step === 0) {
+        pdf.text(labels[index], MARGIN + slot * index + slot / 2, y + chartHeight + 4, {
+          size: 6,
+          color: GREY,
+          align: 'center',
+        });
+      }
+    });
+
+    pdf.text(`pico ${formatDuration(maxMinutes * 60_000)}`, PAGE_WIDTH - MARGIN, y - 12, {
+      size: 6.5,
+      color: GREY,
+      align: 'right',
+    });
+
+    y += chartHeight + 26;
+  };
+
+  // Only for Semana/Mes: on "Día" these would repeat the chart above exactly,
+  // since the range is already a single day - see the matching gate on
+  // HistoryScreen.
+  if (!isDay) {
+    drawCategoryBarChart('Por día de la semana', WEEKDAY_LABELS, data.weekdayMinutes);
+    const hourLabels = Array.from({ length: 24 }, (_, h) => String(h).padStart(2, '0'));
+    drawCategoryBarChart('Por hora', hourLabels, data.hourMinutes);
+  }
+
   // ---- Episodios -----------------------------------------------------------
+  // A busy day of real data easily produces thousands of brief episodes (a
+  // day of the ALAMEDA demo recording alone generates ~2600), and the table
+  // used to print every single one: tens of pages of nothing but rows. The
+  // report is a clinical summary, not a raw dump, so it lists only the most
+  // clinically relevant episodes - worst severity first, then longest - and
+  // says plainly how many were left out.
+  const episodesToShow =
+    data.episodes.length > MAX_PDF_EPISODES
+      ? [...data.episodes]
+          .sort((a, b) => b.maxSeverity - a.maxSeverity || b.durationMs - a.durationMs)
+          .slice(0, MAX_PDF_EPISODES)
+          .sort((a, b) => a.startedAt - b.startedAt)
+      : data.episodes;
+  const omittedCount = data.episodes.length - episodesToShow.length;
+
   sectionTitle(`Episodios (${data.episodes.length})`);
+
+  if (omittedCount > 0) {
+    ensureSpace(14);
+    pdf.text(
+      `Mostrando los ${episodesToShow.length} episodios más relevantes (mayor severidad y duración). ` +
+        `${omittedCount} más no se listan; el resumen y el gráfico de arriba sí los incluyen a todos.`,
+      MARGIN,
+      y,
+      { size: 7.5, color: GREY },
+    );
+    y += 14;
+  }
 
   if (data.episodes.length === 0) {
     pdf.text('Sin episodios de temblor en este período.', MARGIN, y, { size: 9, color: GREY });
@@ -270,7 +368,7 @@ export function buildReportPdf(data: ReportData): string {
 
     drawTableHeader();
 
-    data.episodes.forEach((episode, index) => {
+    episodesToShow.forEach((episode, index) => {
       if (y + 15 > FOOTER_TOP - 10) {
         startPage(false);
         drawTableHeader();

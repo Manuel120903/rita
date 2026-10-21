@@ -295,7 +295,7 @@ export async function getSeverityBuckets(
 ): Promise<SeverityBucket[]> {
   const db = getDatabase();
   const { rows } = await db.execute(
-    `SELECT (received_at - ?) / ? AS bucket,
+    `SELECT CAST((received_at - ?) / ? AS INTEGER) AS bucket,
             SUM(CASE WHEN severity = 0 THEN 1 ELSE 0 END) AS s0,
             SUM(CASE WHEN severity = 1 THEN 1 ELSE 0 END) AS s1,
             SUM(CASE WHEN severity = 2 THEN 1 ELSE 0 END) AS s2,
@@ -353,13 +353,67 @@ export async function getDaysWithData(fromMs: number, toMs: number): Promise<num
   const db = getDatabase();
   const offsetMs = -new Date().getTimezoneOffset() * 60_000;
   const { rows } = await db.execute(
-    `SELECT DISTINCT (received_at + ?) / 86400000 AS day_index
+    `SELECT DISTINCT CAST((received_at + ?) / 86400000 AS INTEGER) AS day_index
        FROM readings
       WHERE received_at >= ? AND received_at < ?`,
     [offsetMs, fromMs, toMs],
   );
 
   return rows.map(row => Math.floor(row.day_index as number) * 86_400_000 - offsetMs);
+}
+
+/** Minutes with tremor (severity 1-2) per weekday, index 0 = Sunday ... 6 = Saturday. */
+export async function getTremorMinutesByWeekday(
+  fromMs: number,
+  toMs: number,
+  cadenceMs: number = NOMINAL_CADENCE_MS,
+): Promise<number[]> {
+  const db = getDatabase();
+  const offsetMs = -new Date().getTimezoneOffset() * 60_000;
+  const { rows } = await db.execute(
+    `SELECT CAST(strftime('%w', (received_at + ?) / 1000, 'unixepoch') AS INTEGER) AS wd,
+            SUM(CASE WHEN severity > 0 THEN 1 ELSE 0 END) AS tremor_count
+       FROM readings
+      WHERE received_at >= ? AND received_at < ?
+      GROUP BY wd`,
+    [offsetMs, fromMs, toMs],
+  );
+
+  const minutes = new Array(7).fill(0);
+  for (const row of rows) {
+    const wd = row.wd as number;
+    if (wd >= 0 && wd < 7) {
+      minutes[wd] = ((row.tremor_count as number) * cadenceMs) / 60_000;
+    }
+  }
+  return minutes;
+}
+
+/** Minutes with tremor (severity 1-2) per hour of day, index 0-23, local time. */
+export async function getTremorMinutesByHour(
+  fromMs: number,
+  toMs: number,
+  cadenceMs: number = NOMINAL_CADENCE_MS,
+): Promise<number[]> {
+  const db = getDatabase();
+  const offsetMs = -new Date().getTimezoneOffset() * 60_000;
+  const { rows } = await db.execute(
+    `SELECT CAST(strftime('%H', (received_at + ?) / 1000, 'unixepoch') AS INTEGER) AS hr,
+            SUM(CASE WHEN severity > 0 THEN 1 ELSE 0 END) AS tremor_count
+       FROM readings
+      WHERE received_at >= ? AND received_at < ?
+      GROUP BY hr`,
+    [offsetMs, fromMs, toMs],
+  );
+
+  const minutes = new Array(24).fill(0);
+  for (const row of rows) {
+    const hr = row.hr as number;
+    if (hr >= 0 && hr < 24) {
+      minutes[hr] = ((row.tremor_count as number) * cadenceMs) / 60_000;
+    }
+  }
+  return minutes;
 }
 
 export async function clearHistory(): Promise<void> {

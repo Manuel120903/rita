@@ -1,12 +1,14 @@
-import React, { useMemo } from 'react';
-import { Text, View } from 'react-native';
-import Svg, { Line, Path } from 'react-native-svg';
-import { SEVERITY_COLORS } from '../ble/constants';
+import React, { useMemo, useState } from 'react';
+import { type LayoutChangeEvent, Text, View } from 'react-native';
+import { LineChart } from 'react-native-gifted-charts';
 import type { SeverityBucket } from '../db/database';
 import { NOMINAL_CADENCE_MS, formatDuration } from '../lib/periods';
 import { bucketLabel, bucketPlan, type DateRange } from '../lib/ranges';
 
-const HEIGHT = 220;
+const HEIGHT = 180;
+
+/** Brand red, same one the live chart's gradient fill uses (see TremorChart). */
+const LINE_COLOR = '#b61c25';
 
 interface HistoryChartProps {
   range: DateRange;
@@ -16,21 +18,18 @@ interface HistoryChartProps {
 }
 
 /**
- * Time per severity across the selected range, as one continuous line per
- * level sharing an x axis, instead of bars.
+ * Minutes with tremor (Moderado + Severo) per bucket, as one smooth filled
+ * curve - the same shape as a typical attendance/activity-over-time chart.
+ *
+ * This used to be three stacked severity series. That read fine as a static
+ * report, but on screen - especially replaying a day of real demo data, which
+ * is ~93% Leve - the single combined line this draws now uses the chart's
+ * full vertical range on its own scale, instead of being one tiny, flattened
+ * slice of a scale Leve dominates. The per-level breakdown is still one
+ * stat tile up, and the full severity split stays in the PDF report.
  *
  * Buckets are hourly for a single day and daily for a week or month; empty
  * buckets are already filled in by the query, so the series is dense.
- */
-/**
- * NOTE: the <Svg> element here is never conditionally removed.
- *
- * The empty state keeps the Svg mounted and drops only its children.
- * Tearing down a react-native-svg view is what this screen has to avoid: the
- * freeze on changing the range was traced to the commit that unmounted this
- * chart — the tap arrived, the render completed, and then no effect ran and
- * the heartbeat stopped, with no data involved. It never happened on first
- * load, where there was no chart to tear down yet.
  */
 export function HistoryChart({
   range,
@@ -38,108 +37,91 @@ export function HistoryChart({
   cadenceMs = NOMINAL_CADENCE_MS,
 }: HistoryChartProps) {
   const plan = useMemo(() => bucketPlan(range), [range]);
-
-  // Height reference for the lines: the tallest single severity count in any
-  // bucket, so all three levels share one scale.
-  const maxCount = useMemo(
-    () => buckets.reduce((max, b) => Math.max(max, b.counts[0], b.counts[1], b.counts[2]), 0),
-    [buckets],
-  );
-
-  // Width is in viewBox units; the SVG scales to the container.
-  const slot = 100 / Math.max(1, buckets.length);
-
-  const levelPaths = useMemo(() => {
-    if (maxCount <= 0) {
-      return ['', '', ''];
-    }
-    return ([0, 1, 2] as const).map(level => {
-      const points = buckets.map((bucket, index) => {
-        const x = slot * index + slot / 2;
-        const y = HEIGHT - (bucket.counts[level] / maxCount) * (HEIGHT - 4) - 2;
-        return { x, y };
-      });
-      if (points.length === 0) {
-        return '';
-      }
-      return points
-        .map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(2)},${p.y.toFixed(2)}`)
-        .join(' ');
-    });
-  }, [buckets, maxCount, slot]);
+  const [width, setWidth] = useState(0);
 
   const labelStep = useMemo(() => {
-    if (buckets.length <= 12) {
+    if (buckets.length <= 8) {
       return 1;
     }
     return plan.hourly ? 3 : buckets.length > 20 ? 3 : 2;
   }, [buckets.length, plan.hourly]);
 
-  const empty = maxCount === 0;
+  // Minutes, not raw counts: a direct, already-familiar unit for this axis,
+  // instead of a reading count nobody has an intuition for.
+  const minutesPerBucket = useMemo(
+    () => buckets.map(b => ((b.counts[1] + b.counts[2]) * cadenceMs) / 60000),
+    [buckets, cadenceMs],
+  );
+
+  const maxMinutes = useMemo(() => Math.max(...minutesPerBucket, 0), [minutesPerBucket]);
+  const empty = maxMinutes === 0;
+
+  const lineData = useMemo(
+    () =>
+      minutesPerBucket.map((minutes, index) => ({
+        value: minutes,
+        label: index % labelStep === 0 ? bucketLabel(range, index) : '',
+      })),
+    [minutesPerBucket, range, labelStep],
+  );
+
+  // gifted-charts lays out in absolute points, not percentages, so the chart
+  // only renders once the container has actually been measured.
+  const slot = width / Math.max(1, buckets.length);
+  const spacing = Math.max(4, slot);
 
   return (
-    <View className="gap-1">
+    <View
+      className="gap-1"
+      onLayout={(e: LayoutChangeEvent) => setWidth(e.nativeEvent.layout.width)}>
       <View className="flex-row items-center justify-between">
         <Text className="text-secondary text-xs">
-          {empty ? 'Sin mediciones en este período' : `Tiempo por ${plan.hourly ? 'hora' : 'día'}`}
+          {empty ? 'Sin temblor en este período' : `Minutos con temblor por ${plan.hourly ? 'hora' : 'día'}`}
         </Text>
         {!empty && (
-          <Text className="text-secondary text-xs">máx {formatDuration(maxCount * cadenceMs)}</Text>
+          <Text className="text-secondary text-xs">pico {formatDuration(maxMinutes * 60000)}</Text>
         )}
       </View>
 
-      <Svg width="100%" height={HEIGHT} viewBox={`0 0 100 ${HEIGHT}`} preserveAspectRatio="none">
-        {/* Guías horizontales al 25/50/75% */}
-        {[0.25, 0.5, 0.75].map(fraction => (
-          <Line
-            key={fraction}
-            x1={0}
-            y1={HEIGHT * (1 - fraction)}
-            x2={100}
-            y2={HEIGHT * (1 - fraction)}
-            stroke="#e6eff8"
-            strokeWidth={0.5}
-          />
-        ))}
-
-        {empty
-          ? null
-          : ([0, 1, 2] as const).map(level =>
-              levelPaths[level] === '' ? null : (
-                <Path
-                  key={level}
-                  d={levelPaths[level]}
-                  stroke={SEVERITY_COLORS[level]}
-                  strokeWidth={1.4}
-                  fill="none"
-                />
-              ),
-            )}
-
-        <Line x1={0} y1={HEIGHT} x2={100} y2={HEIGHT} stroke="#c7ced6" strokeWidth={0.6} />
-      </Svg>
-
-      <View className="flex-row">
-        {buckets.map((_, index) => (
-          <View key={index} className="flex-1 items-center">
-            {index % labelStep === 0 ? (
-              <Text className="text-secondary text-[9px]">{bucketLabel(range, index)}</Text>
-            ) : null}
-          </View>
-        ))}
-      </View>
-
-      <View className="flex-row items-center gap-3 mt-1">
-        {(['Leve', 'Moderado', 'Severo'] as const).map((label, level) => (
-          <View key={label} className="flex-row items-center gap-1.5">
-            <View
-              className="w-2.5 h-2.5 rounded-sm"
-              style={{ backgroundColor: SEVERITY_COLORS[level as 0 | 1 | 2] }}
-            />
-            <Text className="text-secondary text-xs">{label}</Text>
-          </View>
-        ))}
-      </View>
+      {width > 0 && (
+        // No `key` here: HistoryScreen already remounts this whole screen's
+        // content on range-kind change (see its own `key={kind}`), and within
+        // one mount buckets legitimately cycle through EMPTY_BUCKETS (length 0)
+        // while a load is in flight. Keying this on buckets.length would force
+        // gifted-charts to unmount and remount its SVG tree on every load -
+        // which is the exact pattern that used to hang this screen (see the
+        // HistoryScreen comment on why the chart is never swapped for a
+        // spinner).
+        <LineChart
+          data={lineData}
+          width={width - 36}
+          height={HEIGHT}
+          spacing={spacing}
+          initialSpacing={spacing / 2}
+          endSpacing={spacing / 2}
+          maxValue={maxMinutes > 0 ? maxMinutes * 1.15 : 1}
+          noOfSections={4}
+          roundToDigits={0}
+          curved
+          curvature={0.2}
+          areaChart
+          color={LINE_COLOR}
+          startFillColor={LINE_COLOR}
+          endFillColor={LINE_COLOR}
+          startOpacity={0.35}
+          endOpacity={0.02}
+          thickness={2.5}
+          hideDataPoints
+          yAxisThickness={0}
+          xAxisThickness={1}
+          xAxisColor="#c7ced6"
+          rulesColor="#e6eff8"
+          rulesType="solid"
+          yAxisTextStyle={{ color: '#5b5f63', fontSize: 9 }}
+          xAxisLabelTextStyle={{ color: '#5b5f63', fontSize: 9 }}
+          disableScroll
+        />
+      )}
     </View>
   );
 }

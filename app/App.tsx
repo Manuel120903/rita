@@ -7,10 +7,12 @@
 
 import React, { useState } from 'react';
 import { Pressable, StatusBar, Text, View } from 'react-native';
+import { QueryClientProvider } from '@tanstack/react-query';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { HistoryScreen } from './src/screens/HistoryScreen';
 import { useTremorMonitor } from './src/hooks/useTremorMonitor';
+import { queryClient } from './src/lib/queryClient';
 
 type Tab = 'home' | 'history';
 
@@ -32,19 +34,21 @@ function App() {
   const monitor = useTremorMonitor();
 
   return (
-    <SafeAreaProvider>
-      <StatusBar barStyle="dark-content" />
-      <SafeAreaView className="flex-1 bg-background" edges={['top', 'left', 'right', 'bottom']}>
-        <View className="flex-1">
-          {tab === 'home' ? <HomeScreen monitor={monitor} /> : <HistoryScreen />}
-        </View>
+    <QueryClientProvider client={queryClient}>
+      <SafeAreaProvider>
+        <StatusBar barStyle="dark-content" />
+        <SafeAreaView className="flex-1 bg-background" edges={['top', 'left', 'right', 'bottom']}>
+          <View className="flex-1">
+            {tab === 'home' ? <HomeScreen monitor={monitor} /> : <HistoryScreen />}
+          </View>
 
-        <View className="flex-row bg-surface shadow-sm">
-          <TabButton label="Monitor" active={tab === 'home'} onPress={() => setTab('home')} />
-          <TabButton label="Historial" active={tab === 'history'} onPress={() => setTab('history')} />
-        </View>
-      </SafeAreaView>
-    </SafeAreaProvider>
+          <View className="flex-row bg-surface shadow-sm">
+            <TabButton label="Monitor" active={tab === 'home'} onPress={() => setTab('home')} />
+            <TabButton label="Historial" active={tab === 'history'} onPress={() => setTab('history')} />
+          </View>
+        </SafeAreaView>
+      </SafeAreaProvider>
+    </QueryClientProvider>
   );
 }
 

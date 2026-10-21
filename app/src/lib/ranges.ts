@@ -1,10 +1,16 @@
 /**
- * Calendar-based ranges for the history filters.
+ * Ranges for the history filters, in the device's local timezone.
  *
- * These are real calendar boundaries in the device's local timezone, not
- * rolling windows: "Día" is midnight-to-midnight of the selected day, not the
- * last 24 h. The rolling version made "Hoy" include part of yesterday, which is
- * wrong for a log a clinician reads day by day.
+ * "Día" is midnight-to-midnight of the selected day, not a rolling 24 h
+ * window: a rolling day made "Hoy" include part of yesterday, which is wrong
+ * for a log a clinician reads day by day.
+ *
+ * "Semana" and "Mes", by contrast, are rolling: the 7 or 30 days ending on
+ * the selected day (today, by default), not the calendar week (Mon-Sun) or
+ * calendar month (1st-to-1st) it falls in. A clinician asking "how has the
+ * last month looked" means the 30 days up to today, not however much of the
+ * current calendar month has elapsed - on the 2nd of the month that used to
+ * be two days.
  */
 export type RangeKind = 'day' | 'week' | 'month';
 
@@ -49,17 +55,18 @@ export function addMonths(date: Date, months: number): Date {
   return d;
 }
 
+/** Days in the rolling "Semana"/"Mes" windows, anchor day included. */
+const ROLLING_DAYS: Record<'week' | 'month', number> = { week: 7, month: 30 };
+
 export function buildRange(kind: RangeKind, anchor: Date): DateRange {
+  const to = addDays(startOfDay(anchor), 1); // exclusive, end of the anchor day
+
   if (kind === 'day') {
-    const from = startOfDay(anchor);
-    return { fromMs: from.getTime(), toMs: addDays(from, 1).getTime(), kind, anchor };
+    return { fromMs: addDays(to, -1).getTime(), toMs: to.getTime(), kind, anchor };
   }
-  if (kind === 'week') {
-    const from = startOfWeek(anchor);
-    return { fromMs: from.getTime(), toMs: addDays(from, 7).getTime(), kind, anchor };
-  }
-  const from = startOfMonth(anchor);
-  return { fromMs: from.getTime(), toMs: addMonths(from, 1).getTime(), kind, anchor };
+
+  const from = addDays(to, -ROLLING_DAYS[kind]);
+  return { fromMs: from.getTime(), toMs: to.getTime(), kind, anchor };
 }
 
 export function isSameDay(a: Date, b: Date): boolean {
@@ -99,15 +106,19 @@ export function describeRange(range: DateRange): string {
     const today = new Date();
     return isSameDay(from, today) ? `Hoy, ${formatDay(from)}` : formatDay(from);
   }
-  if (range.kind === 'week') {
-    const last = new Date(range.toMs - 1);
-    const sameMonth = from.getMonth() === last.getMonth();
-    const left = sameMonth
-      ? String(from.getDate())
-      : `${from.getDate()} de ${MONTH_NAMES[from.getMonth()]}`;
-    return `Semana del ${left} al ${last.getDate()} de ${MONTH_NAMES[last.getMonth()]} de ${last.getFullYear()}`;
-  }
-  return `${MONTH_NAMES[from.getMonth()]} de ${from.getFullYear()}`;
+
+  // Semana/Mes are rolling windows ending on the anchor day (today, by
+  // default), not the calendar week/month - so the label spells out the
+  // actual span instead of naming a week or month that may only be partly
+  // covered.
+  const last = new Date(range.toMs - 1);
+  const sameMonth = from.getMonth() === last.getMonth() && from.getFullYear() === last.getFullYear();
+  const left = sameMonth
+    ? String(from.getDate())
+    : `${from.getDate()} de ${MONTH_NAMES[from.getMonth()]}`;
+  const right = `${last.getDate()} de ${MONTH_NAMES[last.getMonth()]} de ${last.getFullYear()}`;
+  const label = range.kind === 'week' ? 'Últimos 7 días' : 'Últimos 30 días';
+  return `${label}: ${left} al ${right}`;
 }
 
 /**

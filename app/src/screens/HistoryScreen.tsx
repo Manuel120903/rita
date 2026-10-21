@@ -8,7 +8,9 @@ import {
   Text,
   View,
 } from 'react-native';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { SEVERITY_LABELS, type SeverityLevel } from '../ble/constants';
+import { BarMetricChart } from '../components/BarMetricChart';
 import { Calendar } from '../components/Calendar';
 import { DayBreakdown } from '../components/DayBreakdown';
 import { EventCard } from '../components/EventCard';
@@ -24,11 +26,14 @@ import {
   getCadenceMs,
   getReadingsPage,
   getSeverityBuckets,
+  getTremorMinutesByHour,
+  getTremorMinutesByWeekday,
   summaryFromBuckets,
   type ReadingRow,
   type SeverityBucket,
   type SeveritySummary,
 } from '../db/database';
+import { clearDemoData, hasDemoData, seedDemoData } from '../lib/demoSeed';
 import { sharePdf } from '../lib/exportPdf';
 import {
   NOMINAL_CADENCE_MS,
@@ -80,6 +85,12 @@ const SEVERITY_DOT: Record<SeverityLevel, string> = {
  */
 const EMPTY_BUCKETS: SeverityBucket[] = [];
 const EMPTY_EPISODES: TremorEpisode[] = [];
+const EMPTY_WEEKDAY: number[] = [0, 0, 0, 0, 0, 0, 0];
+const EMPTY_HOUR: number[] = new Array(24).fill(0);
+
+/** Sunday-first, matching how strftime('%w', ...) numbers weekdays in SQLite. */
+const WEEKDAY_LABELS = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
+const HOUR_LABELS = Array.from({ length: 24 }, (_, h) => String(h).padStart(2, '0'));
 
 const EMPTY_SUMMARY: SeveritySummary = {
   counts: [0, 0, 0],
@@ -133,11 +144,8 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
   );
   const [severity, setSeverity] = useState<SeverityFilterValue>(null);
 
-  const [summary, setSummary] = useState<SeveritySummary>(EMPTY_SUMMARY);
   const [episodes, setEpisodes] = useState<TremorEpisode[]>(EMPTY_EPISODES);
-  const [buckets, setBuckets] = useState<SeverityBucket[]>(EMPTY_BUCKETS);
   const [readings, setReadings] = useState<ReadingRow[]>([]);
-  const [readingTotal, setReadingTotal] = useState(0);
   const [cadence, setCadence] = useState(NOMINAL_CADENCE_MS);
   const [daysWithData, setDaysWithData] = useState<number[]>([]);
 
@@ -149,9 +157,74 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
   const [exporting, setExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Demo data (patient 11 of the ALAMEDA dataset, replayed through the same
+  // DSP/classifier the firmware uses) is tagged with its own device id and
+  // never touches the real BLE insert path - see lib/demoSeed.
+  const [demoLoaded, setDemoLoaded] = useState(false);
+  const [demoBusy, setDemoBusy] = useState(false);
+
   const anchor = useMemo(() => new Date(anchorMs), [anchorMs]);
   const visibleMonth = useMemo(() => new Date(visibleMonthMs), [visibleMonthMs]);
   const range = useMemo(() => buildRange(kind, anchor), [kind, anchor]);
+  const queryClient = useQueryClient();
+
+  /**
+   * The three chart queries (bucket chart, weekday, hour-of-day), cached by
+   * TanStack Query instead of the manual load()/state pattern the rest of
+   * this screen uses. This is what fixes "Por día" being slow to show: SQLite
+   * only gets hit once per distinct range, and switching back to a range
+   * already seen (Día <-> Semana, or re-selecting a day from the calendar)
+   * renders from cache instantly instead of re-querying. `staleTime: Infinity`
+   * on the client (see lib/queryClient) means these never refetch on their
+   * own - only on pull-to-refresh or after an action that actually changed
+   * the data (clearHistory, demo load/clear), which explicitly invalidate
+   * them below.
+   *
+   * None of severity/episodeLimit/readingLimit are in these query keys: the
+   * bucket counts and the weekday/hour aggregates don't depend on the
+   * severity filter or on how many rows are paged in, so toggling those no
+   * longer triggers a bucket requery the way the old single load() did.
+   */
+  const bucketPlanForRange = useMemo(() => bucketPlan(range), [range]);
+  const bucketsQuery = useQuery({
+    queryKey: ['history-buckets', range.fromMs, range.toMs, bucketPlanForRange.bucketMs],
+    queryFn: () =>
+      getSeverityBuckets(
+        range.fromMs,
+        range.toMs,
+        bucketPlanForRange.bucketMs,
+        bucketPlanForRange.count,
+      ),
+  });
+  const buckets = bucketsQuery.data ?? EMPTY_BUCKETS;
+  const summary = useMemo(
+    () => (bucketsQuery.data ? summaryFromBuckets(bucketsQuery.data, cadence) : EMPTY_SUMMARY),
+    [bucketsQuery.data, cadence],
+  );
+  // The readings list's pagination total: same severity-aware count the old
+  // load() used to copy out of its own buckets fetch, now read straight off
+  // the cached one instead.
+  const readingTotal = severity === null ? summary.totalReadings : summary.counts[severity];
+
+  const weekdayQuery = useQuery({
+    queryKey: ['history-weekday', range.fromMs, range.toMs, cadence],
+    queryFn: () => getTremorMinutesByWeekday(range.fromMs, range.toMs, cadence),
+  });
+  const weekdayMinutes = weekdayQuery.data ?? EMPTY_WEEKDAY;
+
+  const hourQuery = useQuery({
+    queryKey: ['history-hour', range.fromMs, range.toMs, cadence],
+    queryFn: () => getTremorMinutesByHour(range.fromMs, range.toMs, cadence),
+  });
+  const hourMinutes = hourQuery.data ?? EMPTY_HOUR;
+
+  /**
+   * Drops every cached chart query. Nothing else lives in this client (see
+   * lib/queryClient), so an unfiltered invalidation is exactly "re-fetch the
+   * charts" - called after anything that actually changes the underlying
+   * data: pull-to-refresh, clearing history, loading/clearing demo data.
+   */
+  const invalidateCharts = useCallback(() => queryClient.invalidateQueries(), [queryClient]);
 
   /**
    * Which range the rows in state actually belong to, checked DURING the render.
@@ -178,10 +251,10 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
   useEffect(() => {
     setEpisodeLimit(EPISODES_PAGE);
     setReadingLimit(READINGS_PAGE);
-    // Drop the previous range's rows too. Otherwise the render between the tap
-    // and the query landing mixes the new range with the old buckets — 24 hourly
-    // buckets labelled as days, or the reverse — which is at best wrong on screen.
-    setBuckets(EMPTY_BUCKETS);
+    // Drop the previous range's episodes too. Otherwise the render between the
+    // tap and the query landing mixes the new range with the old ones. Buckets
+    // don't need this: bucketsQuery is keyed by range, so a still-loading new
+    // key never reads as the old range's data (see the comment on the query).
     setEpisodes(EMPTY_EPISODES);
   }, [range.fromMs, range.toMs, severity]);
 
@@ -203,21 +276,13 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
     const key = `${activeRange.fromMs}|${activeRange.toMs}|${severity ?? 'all'}`;
 
     try {
-      const plan = bucketPlan(activeRange);
-
       // First, how far apart the readings in this range actually are. Everything
       // that reports a duration is "how many readings times how long each stands
       // for", so this has to be measured before any of it — see getCadenceMs.
+      // The bucket chart and the weekday/hour aggregates no longer go through
+      // here - they're their own cached queries (bucketsQuery/weekdayQuery/
+      // hourQuery, above) - but episodes and this cadence measurement still do.
       const nextCadence = await getCadenceMs(activeRange.fromMs, activeRange.toMs);
-
-      // Run one at a time rather than through Promise.all: they all share a
-      // single SQLite connection, so they end up serialized anyway.
-      const nextBuckets = await getSeverityBuckets(
-        activeRange.fromMs,
-        activeRange.toMs,
-        plan.bucketMs,
-        plan.count,
-      );
 
       // Episodes are loaded for every range, week and month included.
       //
@@ -245,21 +310,13 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
         0,
       );
 
-      // Summary and the pagination total come from the buckets rather than from
-      // two more queries over the same rows — see summaryFromBuckets.
-      const nextSummary = summaryFromBuckets(nextBuckets, nextCadence);
-      const total = severity === null ? nextSummary.totalReadings : nextSummary.counts[severity];
-
       if (token !== loadToken.current) {
         return; // a newer load already started
       }
 
       setCadence(nextCadence);
-      setSummary(nextSummary);
       setEpisodes(buildEpisodes(periods).reverse());
-      setBuckets(nextBuckets);
       setReadings(nextReadings);
-      setReadingTotal(total);
       setError(null);
       setLoadedKey(key);
     } catch (err) {
@@ -268,11 +325,8 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
       }
       const message = err instanceof Error ? err.message : String(err);
       console.warn('No se pudo leer el historial', err);
-      setSummary(EMPTY_SUMMARY);
       setEpisodes(EMPTY_EPISODES);
-      setBuckets(EMPTY_BUCKETS);
       setReadings([]);
-      setReadingTotal(0);
       setError(message);
       // The empty rows do belong to this range, so the screen can stop waiting
       // and show the error instead of a spinner that never ends.
@@ -304,11 +358,64 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
     loadMarkers();
   }, [loadMarkers]);
 
+  useEffect(() => {
+    hasDemoData()
+      .then(setDemoLoaded)
+      .catch(() => setDemoLoaded(false));
+  }, []);
+
+  const onToggleDemo = useCallback(() => {
+    if (demoLoaded) {
+      Alert.alert('Quitar datos de demostración', 'Se eliminan solo las mediciones de demostración (paciente 11, dataset ALAMEDA). El historial real del sensor no se toca.', [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Quitar',
+          style: 'destructive',
+          onPress: async () => {
+            setDemoBusy(true);
+            try {
+              await clearDemoData();
+              setDemoLoaded(false);
+              invalidateCharts();
+              await Promise.all([load(), loadMarkers()]);
+            } catch (err) {
+              Alert.alert('No se pudo quitar', err instanceof Error ? err.message : String(err));
+            } finally {
+              setDemoBusy(false);
+            }
+          },
+        },
+      ]);
+      return;
+    }
+
+    Alert.alert('Cargar datos de demostración', '16 días reales de un paciente del dataset público ALAMEDA (acelerómetro GENEActiv), procesados con el mismo algoritmo del firmware y ubicados en los últimos 16 días del calendario. Se suma al historial sin afectar las mediciones del sensor.', [
+      { text: 'Cancelar', style: 'cancel' },
+      {
+        text: 'Cargar',
+        onPress: async () => {
+          setDemoBusy(true);
+          try {
+            await seedDemoData();
+            setDemoLoaded(true);
+            invalidateCharts();
+            await Promise.all([load(), loadMarkers()]);
+          } catch (err) {
+            Alert.alert('No se pudo cargar', err instanceof Error ? err.message : String(err));
+          } finally {
+            setDemoBusy(false);
+          }
+        },
+      },
+    ]);
+  }, [demoLoaded, load, loadMarkers, invalidateCharts]);
+
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
+    invalidateCharts();
     await Promise.all([load(), loadMarkers()]);
     setRefreshing(false);
-  }, [load, loadMarkers]);
+  }, [load, loadMarkers, invalidateCharts]);
 
   const onShowMoreReadings = useCallback(() => {
     setLoadingMore(true);
@@ -333,15 +440,17 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
           onPress: async () => {
             try {
               await clearHistory();
+              setDemoLoaded(false);
             } catch (err) {
               Alert.alert('No se pudo borrar', err instanceof Error ? err.message : String(err));
             }
+            invalidateCharts();
             await Promise.all([load(), loadMarkers()]);
           },
         },
       ],
     );
-  }, [load, loadMarkers]);
+  }, [load, loadMarkers, invalidateCharts]);
 
   const onSelectDay = useCallback((day: Date) => {
     setAnchorMs(startOfDay(day).getTime());
@@ -372,6 +481,8 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
         buckets,
         generatedAt: Date.now(),
         cadenceMs: cadence,
+        weekdayMinutes,
+        hourMinutes,
       });
 
       const outcome = await sharePdf(base64, reportFileName(range), reportSubject(range));
@@ -390,7 +501,7 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
     } finally {
       setExporting(false);
     }
-  }, [range, summary, episodes, buckets, cadence]);
+  }, [range, summary, episodes, buckets, cadence, weekdayMinutes, hourMinutes]);
 
   // Episodes are stretches of tremor, so they only exist for Moderado/Severo.
   const filteredEpisodes = useMemo(
@@ -451,9 +562,23 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
       <View key={kind} className="gap-4">
           <View className="flex-row items-center justify-between">
             <Text className="text-on-surface text-2xl font-bold">Historial</Text>
-            <Pressable onPress={onClear} className="px-3 py-1.5 rounded-lg bg-surface-container-high">
-              <Text className="text-secondary text-xs font-semibold">Borrar</Text>
-            </Pressable>
+            <View className="flex-row gap-2">
+              <Pressable
+                onPress={onToggleDemo}
+                disabled={demoBusy}
+                className="px-3 py-1.5 rounded-lg bg-surface-container-high">
+                {demoBusy ? (
+                  <ActivityIndicator color="#5b5f63" size="small" />
+                ) : (
+                  <Text className="text-secondary text-xs font-semibold">
+                    {demoLoaded ? 'Quitar demo' : 'Cargar demo'}
+                  </Text>
+                )}
+              </Pressable>
+              <Pressable onPress={onClear} className="px-3 py-1.5 rounded-lg bg-surface-container-high">
+                <Text className="text-secondary text-xs font-semibold">Borrar</Text>
+              </Pressable>
+            </View>
           </View>
 
           {error !== null && (
@@ -529,12 +654,14 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
               value={String(episodes.length)}
               unit="detectados"
               icon={<AnalyticsIcon size={18} />}
+              animateOnChange
             />
             <StatTile
               label="Tiempo con temblor"
               value={formatDurationValue(summary.tremorDurationMs)}
               unit={durationUnit(summary.tremorDurationMs)}
               icon={<PulseIcon size={18} />}
+              animateOnChange
             />
           </View>
           <View className="flex-row gap-3">
@@ -544,6 +671,7 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
                 value={summary.avgRms !== null ? summary.avgRms.toFixed(3) : '--'}
                 unit="m/s²"
                 icon={<PulseIcon size={18} />}
+                animateOnChange
               />
             ) : (
               <StatTile
@@ -551,6 +679,7 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
                 value={String(daysWithTremor)}
                 unit={`de ${buckets.length}`}
                 icon={<AnalyticsIcon size={18} />}
+                animateOnChange
               />
             )}
             <StatTile
@@ -558,6 +687,7 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
               value={summary.maxRms !== null ? summary.maxRms.toFixed(3) : '--'}
               unit="m/s²"
               icon={<PulseIcon size={18} />}
+              animateOnChange
             />
           </View>
 
@@ -576,21 +706,53 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
 
           <View className="bg-surface p-4 rounded-2xl shadow-sm gap-2">
             <View className="flex-row items-center justify-between">
-              <Text className="text-on-surface text-base font-bold">Actividad del período</Text>
-              {!dataReady && <ActivityIndicator color="#b61c25" size="small" />}
+              <Text className="text-on-surface text-base font-bold">
+                {isDay ? 'Por hora' : 'Por día'}
+              </Text>
+              {/* bucketsQuery's own loading state, not dataReady: that one
+                  tracks episodes/readings, which load separately now and
+                  would otherwise blank out an already-cached chart while
+                  they finish. */}
+              {bucketsQuery.isFetching && <ActivityIndicator color="#b61c25" size="small" />}
             </View>
             {/*
-              El gráfico queda montado siempre, incluso mientras carga: se le pasan
-              los buckets vacíos y él dibuja su estado vacío. Reemplazarlo por un
-              spinner lo desmontaba, y desmontar sus vistas SVG es lo que colgaba
-              la app al cambiar de rango. Ver la nota en HistoryChart.
+              El gráfico queda montado siempre, incluso mientras carga: se le
+              pasan los buckets vacíos (bucketsQuery.data es undefined hasta
+              que resuelve) y él dibuja su estado vacío. Reemplazarlo por un
+              spinner lo desmontaba, y desmontar sus vistas SVG es lo que
+              colgaba la app al cambiar de rango. Ver la nota en HistoryChart.
             */}
-            <HistoryChart
-              range={range}
-              buckets={dataReady ? buckets : EMPTY_BUCKETS}
-              cadenceMs={cadence}
-            />
+            <HistoryChart range={range} buckets={buckets} cadenceMs={cadence} />
           </View>
+
+          {/*
+            Por día de la semana / por hora: desgloses de categoría fija, no de
+            eje temporal, así que solo aportan algo nuevo en semana/mes - en
+            "Día" son el mismo dato que el gráfico de arriba (el rango es un
+            único día), así que no se repiten.
+          */}
+          {!isDay && (
+            <>
+              <View className="bg-surface p-4 rounded-2xl shadow-sm gap-2">
+                <Text className="text-on-surface text-base font-bold">Por día de la semana</Text>
+                <BarMetricChart
+                  labels={WEEKDAY_LABELS}
+                  values={weekdayMinutes}
+                  emptyLabel="Sin temblor en este período"
+                />
+              </View>
+
+              <View className="bg-surface p-4 rounded-2xl shadow-sm gap-2">
+                <Text className="text-on-surface text-base font-bold">Por hora</Text>
+                <BarMetricChart
+                  labels={HOUR_LABELS}
+                  values={hourMinutes}
+                  labelStep={3}
+                  emptyLabel="Sin temblor en este período"
+                />
+              </View>
+            </>
+          )}
 
           <Pressable
             onPress={onExport}
