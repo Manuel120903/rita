@@ -11,6 +11,10 @@ volatile bool g_connected = false;
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override {
     g_connected = true;
+    // Ahorro de bateria: pedir un intervalo de conexion de 100-200 ms (unidades
+    // de 1.25 ms), latencia 0, timeout 4 s (unidades de 10 ms). Se generan solo
+    // ~3 paquetes/s, asi que caben todos sin perder datos.
+    server->updateConnParams(connInfo.getConnHandle(), 80, 160, 0, 400);
     // Only one client (the paired phone) is expected; keep advertising off
     // while connected and resume on disconnect.
     NimBLEDevice::stopAdvertising();
@@ -29,6 +33,8 @@ void TremorBleService::begin(uint8_t deviceId) {
   char deviceName[32];
   snprintf(deviceName, sizeof(deviceName), "%s-%02X", BLE_DEVICE_NAME_PREFIX, deviceId);
   NimBLEDevice::init(deviceName);
+  // Menor potencia de radio: el celular siempre esta cerca.
+  NimBLEDevice::setPower(0); // dBm
 
   g_server = NimBLEDevice::createServer();
   g_server->setCallbacks(new ServerCallbacks());
@@ -42,6 +48,10 @@ void TremorBleService::begin(uint8_t deviceId) {
 
   NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
   advertising->addServiceUUID(TREMOR_SERVICE_UUID);
+  // Anunciar cada ~500 ms en vez del intervalo rapido por defecto
+  // (unidades de 0.625 ms: 800 = 500 ms).
+  advertising->setMinInterval(800);
+  advertising->setMaxInterval(800);
   advertising->start();
 }
 

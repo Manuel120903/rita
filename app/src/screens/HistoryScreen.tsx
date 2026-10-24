@@ -769,7 +769,7 @@ export const HistoryScreen = React.memo(function HistoryScreenView() {
               className={`font-bold text-sm ${
                 exporting || !hasData ? 'text-secondary' : 'text-on-primary'
               }`}>
-              {exporting ? 'Generando PDF…' : 'Exportar reporte en PDF'}
+              {exporting ? 'Generando PDF…' : 'Exportar reporte  en PDF'}
             </Text>
           </Pressable>
 

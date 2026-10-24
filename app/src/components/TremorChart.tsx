@@ -17,7 +17,17 @@ interface TremorChartProps {
 }
 
 const WIDTH = 320;
+/** Smallest span the x-axis can shrink to, so the first few readings don't stretch absurdly. */
+const MIN_SPAN_MS = 10000;
 const AnimatedCircle = Animated.createAnimatedComponent(Circle);
+
+function formatSpan(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `hace ${s} s`;
+  const m = Math.floor(s / 60);
+  const rest = s % 60;
+  return rest === 0 ? `hace ${m} min` : `hace ${m} min ${rest} s`;
+}
 
 /** Catmull-Rom -> cubic Bezier, so the line reads as a smooth trace instead of a jagged polyline. */
 function smoothPath(coords: { x: number; y: number }[]): string {
@@ -75,13 +85,19 @@ export function TremorChart({ points, height = 120, windowMs = 120000 }: TremorC
   const now = useLiveClock(points.length > 0);
   const pulse = usePulse();
 
-  const { linePath, areaPath, lastPoint, hasData } = useMemo(() => {
-    const windowStart = now - windowMs;
-    const visible = points.filter(p => p.receivedAt >= windowStart);
+  const { linePath, areaPath, lastPoint, hasData, spanMs } = useMemo(() => {
+    const visible = points.filter(p => p.receivedAt >= now - windowMs);
 
     if (visible.length === 0) {
-      return { linePath: '', areaPath: '', lastPoint: null as { x: number; y: number; color: string } | null, hasData: false };
+      return { linePath: '', areaPath: '', lastPoint: null as { x: number; y: number; color: string } | null, hasData: false, spanMs: windowMs };
     }
+
+    // Adaptive x-axis: span from the oldest visible reading to now, growing up to
+    // windowMs. With a fixed 2-min window, the first seconds of data were
+    // squeezed against the right edge.
+    const oldest = Math.min(...visible.map(p => p.receivedAt));
+    const span = Math.min(windowMs, Math.max(MIN_SPAN_MS, now - oldest));
+    const windowStart = now - span;
 
     const max = Math.max(...visible.map(p => p.rms), 0.0001);
     const min = Math.min(...visible.map(p => p.rms), 0);
@@ -90,7 +106,7 @@ export function TremorChart({ points, height = 120, windowMs = 120000 }: TremorC
     const usableHeight = height - padTop;
 
     const coords = visible.map(p => ({
-      x: ((p.receivedAt - windowStart) / windowMs) * WIDTH,
+      x: Math.min(WIDTH, Math.max(0, ((p.receivedAt - windowStart) / span) * WIDTH)),
       y: padTop + usableHeight - ((p.rms - min) / range) * usableHeight,
       color: SEVERITY_COLORS[p.severity],
     }));
@@ -101,7 +117,7 @@ export function TremorChart({ points, height = 120, windowMs = 120000 }: TremorC
         ? `${line} L ${coords[coords.length - 1].x.toFixed(1)} ${height} L ${coords[0].x.toFixed(1)} ${height} Z`
         : '';
 
-    return { linePath: line, areaPath: area, lastPoint: coords[coords.length - 1], hasData: true };
+    return { linePath: line, areaPath: area, lastPoint: coords[coords.length - 1], hasData: true, spanMs: span };
   }, [points, now, windowMs, height]);
 
   if (!hasData) {
@@ -135,7 +151,7 @@ export function TremorChart({ points, height = 120, windowMs = 120000 }: TremorC
         )}
       </Svg>
       <View className="flex-row justify-between pt-1.5">
-        <Text className="text-secondary text-xs">hace {Math.round(windowMs / 60000)} min</Text>
+        <Text className="text-secondary text-xs">{formatSpan(spanMs)}</Text>
         <Text className="text-tertiary text-xs font-semibold">Ahora</Text>
       </View>
     </View>

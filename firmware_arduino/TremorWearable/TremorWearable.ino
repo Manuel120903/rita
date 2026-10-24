@@ -40,6 +40,24 @@ static constexpr int PIN_SCL = 7; // D5
 static constexpr uint8_t DEVICE_ID = 0x01;
 static constexpr uint32_t SAMPLE_PERIOD_US = 10000; // 10 ms -> 100 Hz
 
+// ==== Ahorro de bateria ====
+// Frecuencia del CPU: 80 MHz es el minimo con el que el radio BLE funciona y
+// sobra para el pipeline (antes 160 MHz). Si el aviso de presupuesto de tiempo
+// aparece en el Serial, subirlo a 160.
+static constexpr uint32_t CPU_FREQ_MHZ = 80;
+
+// Mensajes de diagnostico por Serial. En uso real nadie los lee y gastan
+// energia; poner en 1 solo para depurar/probar.
+#define ENABLE_SERIAL_LOG 0
+
+#if ENABLE_SERIAL_LOG
+#define LOG_PRINTLN(...) Serial.println(__VA_ARGS__)
+#define LOG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+#define LOG_PRINTLN(...) ((void)0)
+#define LOG_PRINTF(...) ((void)0)
+#endif
+
 static MPU6050 mpu;
 static TremorBandpassFilter filterX, filterY, filterZ;
 static GrossMotionFilter motionFilterX, motionFilterY, motionFilterZ;
@@ -49,6 +67,10 @@ static TremorBleService ble;
 
 static hw_timer_t *sampleTimer = nullptr;
 static volatile bool sampleFlagISR = false;
+// Tarea de loop(): la ISR la despierta con una notificacion, asi entre muestras
+// la tarea queda bloqueada y el CPU entra en reposo (idle/WFI) en vez de girar
+// en vacio comprobando el flag.
+static TaskHandle_t loopTaskHandle = nullptr;
 
 // Instrumentacion del presupuesto de tiempo. El analisis de una ventana corre
 // dentro de loop(), entre dos muestras, y solo hay UN flag de pendiente: si ese
@@ -69,20 +91,33 @@ void IRAM_ATTR onSampleTimer() {
     droppedSamples++;
   }
   sampleFlagISR = true;
+  if (loopTaskHandle) {
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(loopTaskHandle, &woken);
+    if (woken) {
+      portYIELD_FROM_ISR();
+    }
+  }
 }
 
 void setup() {
+  setCpuFrequencyMhz(CPU_FREQ_MHZ);
+
+#if ENABLE_SERIAL_LOG
   Serial.begin(115200);
   delay(200);
+#endif
 
   if (!mpu.begin(PIN_SDA, PIN_SCL)) {
-    Serial.println("[MPU6050] No se pudo inicializar el sensor. Revisa el cableado I2C.");
+    LOG_PRINTLN("[MPU6050] No se pudo inicializar el sensor. Revisa el cableado I2C.");
   } else {
-    Serial.println("[MPU6050] Sensor inicializado (I2C 400 kHz, +-2g).");
+    LOG_PRINTLN("[MPU6050] Sensor inicializado (I2C 400 kHz, +-2g, solo acelerometro).");
   }
 
   ble.begin(DEVICE_ID);
-  Serial.println("[BLE] Anunciando servicio de monitoreo de temblores.");
+  LOG_PRINTLN("[BLE] Anunciando servicio de monitoreo de temblores.");
+
+  loopTaskHandle = xTaskGetCurrentTaskHandle();
 
   // API de timer del core esp32 3.x: timerBegin ahora recibe la frecuencia del
   // tick directamente (1 MHz -> cada tick = 1 us), y el periodo del alarm se
@@ -94,7 +129,11 @@ void setup() {
 
 void loop() {
   if (!sampleFlagISR) {
-    return;
+    // Dormir hasta que el timer avise (timeout de seguridad de 20 ms).
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+    if (!sampleFlagISR) {
+      return;
+    }
   }
   sampleFlagISR = false;
 
@@ -129,12 +168,12 @@ void loop() {
   // linea de 200 caracteres son ~17ms, mas que el periodo de muestreo, o sea
   // que el log mismo haria perder muestras. Por eso el diagnostico de tiempos
   // va aparte y cada 10 ventanas (~3.2 s), no en cada una.
-  Serial.printf("RMS=%.4f  PSD_max=%.5f  motionRms=%.4f  purity=%.2f  severity=%d  connected=%d\n", rms, psdMax,
-                motionRms, spectralPurity, severity, ble.isConnected());
+  LOG_PRINTF("RMS=%.4f  PSD_max=%.5f  motionRms=%.4f  purity=%.2f  severity=%d  connected=%d\n", rms, psdMax,
+             motionRms, spectralPurity, severity, ble.isConnected());
 
   analysisWindows++;
   if (analysisWindows % 10 == 0) {
-    Serial.printf("[tiempos] analisis=%luus  max=%luus  presupuesto=%luus  perdidas=%lu\n",
+    LOG_PRINTF("[tiempos] analisis=%luus  max=%luus  presupuesto=%luus  perdidas=%lu\n",
                   (unsigned long)analysisUs, (unsigned long)analysisMaxUs, (unsigned long)SAMPLE_PERIOD_US,
                   (unsigned long)droppedSamples);
   }
@@ -143,7 +182,7 @@ void loop() {
   // Se avisa una sola vez para no empeorar el problema llenando el Serial.
   if (analysisMaxUs > SAMPLE_PERIOD_US && !budgetWarningShown) {
     budgetWarningShown = true;
-    Serial.printf("[AVISO] El analisis tardo %luus, mas que el periodo de muestreo (%luus): se pierden "
+    LOG_PRINTF("[AVISO] El analisis tardo %luus, mas que el periodo de muestreo (%luus): se pierden "
                   "muestras y el muestreo deja de ser uniforme. Mover el analisis a una tarea aparte, o "
                   "abaratarlo (ventana mas corta / hop mas largo / menos ejes con FFT).\n",
                   (unsigned long)analysisMaxUs, (unsigned long)SAMPLE_PERIOD_US);

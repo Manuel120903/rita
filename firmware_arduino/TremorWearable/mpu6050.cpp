@@ -3,6 +3,9 @@
 
 namespace {
 constexpr uint8_t REG_PWR_MGMT_1 = 0x6B;
+constexpr uint8_t REG_PWR_MGMT_2 = 0x6C;
+constexpr uint8_t PWR1_TEMP_DIS = 0x08;    // PWR_MGMT_1 bit 3: apaga el termometro (reloj interno 8 MHz)
+constexpr uint8_t PWR2_STBY_GYRO = 0x07;   // PWR_MGMT_2 bits [2:0]: giroscopio X/Y/Z en standby
 constexpr uint8_t REG_ACCEL_CONFIG = 0x1C;
 constexpr uint8_t REG_ACCEL_XOUT_H = 0x3B; // burst read starts here, 6 bytes -> 0x40
 constexpr uint8_t ACCEL_FS_2G = 0x00;      // ACCEL_CONFIG bits [4:3] = 00 -> +-2g
@@ -15,10 +18,17 @@ bool MPU6050::begin(int sdaPin, int sclPin, uint8_t addr) {
   Wire.setClock(400000); // Fast Mode, per hardware spec
 
   // Wake up the sensor: PWR_MGMT_1 defaults to sleep mode enabled at power-on.
-  if (!writeRegister(REG_PWR_MGMT_1, 0x00)) {
+  // Ahorro de bateria: se despierta con el termometro apagado y reloj interno
+  // (el PLL del giroscopio no sirve si el giroscopio esta apagado).
+  if (!writeRegister(REG_PWR_MGMT_1, PWR1_TEMP_DIS)) {
     return false;
   }
   delay(10);
+
+  // Solo se usa el acelerometro: giroscopio en standby.
+  if (!writeRegister(REG_PWR_MGMT_2, PWR2_STBY_GYRO)) {
+    return false;
+  }
 
   // Explicitly select +-2g full scale (16384 LSB/g).
   if (!writeRegister(REG_ACCEL_CONFIG, ACCEL_FS_2G)) {
